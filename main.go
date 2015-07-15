@@ -28,7 +28,7 @@ func main() {
 	errchan := make(chan error)
 
 	go listener.Start(errchan, true)
-	defer Shutdown(listener, upstartController, errchan)
+	defer shutdown(listener, upstartController, errchan)
 
 	for {
 		select {
@@ -41,40 +41,40 @@ func main() {
 	}
 }
 
-func Shutdown(netlinkListener *netlink.Listener, upstartController UpstartController, errchan chan error) {
+func shutdown(netlinkListener *netlink.Listener, upstartController UpstartController, errchan chan error) {
+	log.Printf("Shutting down netlink listener")
 	netlinkListener.Close()
 	close(errchan)
 }
 
 func netlinkMessageReceived(msg netlink.Message, upstartController UpstartController) {
 	switch msg.Header.MessageType() {
-	case rtnetlink.RTM_NEWLINK:
-		interfaceAdded(msg, upstartController)
-	case rtnetlink.RTM_DELLINK:
-		interfaceRemoved(msg, upstartController)
-	case rtnetlink.RTM_SETLINK:
-		log.Printf("Received RTM_SETLINK")
+	case rtnetlink.RTM_SETLINK, rtnetlink.RTM_NEWLINK, rtnetlink.RTM_DELLINK:
+		interfaceMessageReceived(msg, upstartController)
 	}
 }
 
-func interfaceRemoved(msg netlink.Message, upstartController UpstartController) {
-	log.Printf("Received interface removed message")
-}
-
-func interfaceAdded(msg netlink.Message, upstartController UpstartController) {
-	hdr := &link.Header{}
-	rtmsg := rtnetlink.NewMessage(hdr, nil)
-	err := rtmsg.UnmarshalNetlink(msg.Body)
+func interfaceMessageReceived(msg netlink.Message, upstartController UpstartController) {
+	rtmsg, err := link.ParseMessage(msg)
 	if err != nil {
 		log.Panicf("Can't unmarshal rtnetlink message: %v", err)
 		return
 	}
 	address, err := netlink.GetAttributeCString(rtmsg, link.IFLA_IFNAME)
 	if err != nil {
-		address = "Error"
+		log.Panicf("Can't read interface name: %v", err)
+		return
 	}
-	log.Printf("New link[%d] with Flags: %s and name: %s and changes: %s", hdr.InterfaceIndex(),
-		hdr.Flags().Strings(), address, hdr.InterfaceChanges().Strings())
+	hdr, _ := rtmsg.Header.(*link.Header)
+	flags := hdr.Flags()
+	env := []string{fmt.Sprintf("IFACE=%s", address)}
+	if flags&link.IFF_UP != 0 {
+		log.Printf("Link %s is up", address)
+		upstartController.Emit("net-device-up", env, false)
+	} else {
+		log.Printf("Link %s is down", address)
+		upstartController.Emit("net-device-down", env, false)
+	}
 }
 
 func printRouteMessage(msg netlink.Message) {

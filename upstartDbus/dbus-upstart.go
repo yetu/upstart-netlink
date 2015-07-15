@@ -1,6 +1,8 @@
 package upstartDbus
 
 import (
+	"log"
+
 	"github.com/godbus/dbus"
 )
 
@@ -11,8 +13,14 @@ type Controller struct {
 
 func NewController() (controller *Controller, fail error) {
 
-	con, err := dbus.SessionBus()
+	con, err := dbus.SystemBusPrivate()
 	if err != nil {
+		fail = err
+		return
+	}
+	err = con.Auth(nil)
+	if err != nil {
+		log.Panicf("Can't authenticate to Dbus: %v", err)
 		fail = err
 		return
 	}
@@ -22,10 +30,7 @@ func NewController() (controller *Controller, fail error) {
 	return
 }
 
-func (controller Controller) Emit(name string, env []string, wait bool) (err error) {
-	call := controller.upstartObject.Call("com.ubuntu.Upstart0_6.EmitEvent", dbus.FlagNoReplyExpected, name, env, wait)
-	if call.Err != nil {
-		err = call.Err
-	}
-	return
+func (controller Controller) Emit(name string, env []string, wait bool) error {
+	log.Printf("Emetting event %s with env %v", name, env)
+	return controller.upstartObject.Call("com.ubuntu.Upstart0_6.EmitEvent", 0, name, env, wait).Store()
 }
