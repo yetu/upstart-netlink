@@ -34,3 +34,7 @@ func (controller Controller) Emit(name string, env []string, wait bool) error {
 	log.Printf("Emetting event %s with env %v", name, env)
 	return controller.upstartObject.Call("com.ubuntu.Upstart0_6.EmitEvent", 0, name, env, wait).Store()
 }
+
+func (controller *Controller) Close() {
+	controller.conn.Close()
+}
