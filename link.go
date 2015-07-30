@@ -10,6 +10,7 @@ package main
 import (
 	"fmt"
 	"net"
+	"runtime"
 
 	"github.com/yetu/go-netlink/rtnetlink/addr"
 	"github.com/yetu/go-netlink/rtnetlink/link"
@@ -40,6 +41,10 @@ func (self *LinkHandler) LinkAddress() (s []byte) {
 	return
 }
 
+func (lnk *LinkHandler) IsUp() bool {
+	return lnk.LinkFlags()&link.IFF_UP == 1
+}
+
 func (self *LinkHandler) LinkIp() (ip net.IP) {
 	bytes := self.LinkAddress()
 	isNull := false
@@ -53,7 +58,7 @@ func (self *LinkHandler) LinkIp() (ip net.IP) {
 		ip = nil
 		return
 	}
-	copy(ip, bytes)
+	ip = convertBytesToIp(bytes)
 	return
 }
 
@@ -74,6 +79,10 @@ func (self *LinkHandler) LinkIndex() (i uint32) {
 		i = hdr.InterfaceIndex()
 	}
 	return
+}
+
+func (link *LinkHandler) IsReady() bool {
+	return link.IsUp() && len(link.addresses) > 0
 }
 
 func (self *LinkHandler) LinkName() (s string) {
@@ -107,22 +116,19 @@ func (manager *LinkManager) queryDevices() (err error) {
 	if err != nil {
 		return
 	}
-	log.Printf("Querying current devices")
-	err = manager.l.Query(*nlmsg)
+	err = manager.l.Query(nlmsg)
 	if err != nil {
 		return
 	}
 	return
 }
 
-func (manager *LinkManager) queryAddress(index uint32) (err error) {
-	hdr := addr.NewHeader(0, 0, 0, 0, index)
-	nlmsg, err := netlink.NewMessage(rtnetlink.RTM_GETADDR, netlink.NLM_F_DUMP|netlink.NLM_F_REQUEST, hdr)
+func (manager *LinkManager) queryAddress() (err error) {
+	nlmsg, err := netlink.NewMessage(rtnetlink.RTM_GETADDR, netlink.NLM_F_DUMP|netlink.NLM_F_REQUEST, &addr.Header{})
 	if err != nil {
 		return
 	}
-	log.Printf("Querying current addresses")
-	err = manager.l.Query(*nlmsg)
+	err = manager.l.Query(nlmsg)
 	if err != nil {
 		return
 	}
@@ -132,12 +138,17 @@ func (manager *LinkManager) queryAddress(index uint32) (err error) {
 func (manager *LinkManager) Start() {
 	log.Printf("Starting LinkManager")
 	errchan := make(chan error)
-	go manager.l.Start(errchan)
+	manager.l.Start(errchan)
 	manager.running = true
 
 	err := manager.queryDevices()
 	if err != nil {
 		log.Panicf("Something went wrong when querying devices: %v", err)
+	}
+
+	err = manager.queryAddress()
+	if err != nil {
+		log.Panicf("Something went wrong when querying addresses: %v", err)
 	}
 
 	for manager.running {
@@ -146,6 +157,8 @@ func (manager *LinkManager) Start() {
 			manager.netlinkMessageReceived(&msg)
 		case err := <-errchan:
 			log.Printf("Received error from listener: %v", err)
+		default:
+			runtime.Gosched()
 		}
 	}
 }
@@ -168,30 +181,67 @@ func (manager *LinkManager) netlinkMessageReceived(msg *netlink.Message) {
 		ifIndex := hdr.InterfaceIndex()
 		link := manager.links[ifIndex]
 		if link == nil {
-			link := &LinkHandler{cache: rtmsg}
+			link := &LinkHandler{cache: rtmsg, addresses: make([]*net.IP, 0, 5)}
 			manager.links[hdr.InterfaceIndex()] = link
 			manager.interfaceChanged(rtmsg, link, true)
 		} else {
 			link.cache = rtmsg
 			manager.interfaceChanged(rtmsg, link, false)
 		}
-	case rtnetlink.RTM_NEWADDR, rtnetlink.RTM_GETADDR, rtnetlink.RTM_DELADDR:
-		log.Printf("Received address message")
+	case rtnetlink.RTM_DELLINK:
+		manager.linkRemoved(msg)
+	case rtnetlink.RTM_NEWADDR, rtnetlink.RTM_GETADDR:
 		manager.addrReceived(msg)
-	case rtnetlink.RTM_NEWROUTE, rtnetlink.RTM_GETROUTE, rtnetlink.RTM_DELROUTE:
+	case rtnetlink.RTM_DELADDR:
+		manager.addressRemoved(msg)
+	case rtnetlink.RTM_NEWROUTE, rtnetlink.RTM_GETROUTE:
 		log.Printf("Received route message")
-	case netlink.NLMSG_ERROR:
-		log.Printf("Received error packet from netlink. Header: %v, Body: %v", msg.Header, msg.Body)
-		errpkt := &netlink.Error{}
-		ob, err := msg.MarshalNetlink()
-		err = errpkt.UnmarshalNetlink(ob)
-		if err != nil {
-			log.Panicf("Can't unmarshall error message: %v", err)
-		} else {
-			log.Printf("Error code %d, message %s", errpkt.Code(), errpkt.Error())
+	case netlink.NLMSG_UNSPECIFIED:
+		log.Printf("Received unspecified message. Header: %v Body %v", msg.Header, msg.Body)
+	case netlink.NLMSG_DONE:
+		// DO nothing with this.
+	}
+}
+
+func (manager *LinkManager) linkRemoved(msg *netlink.Message) {
+	rtmsg, err := link.ParseMessage(*msg)
+	hdr, _ := rtmsg.Header.(*link.Header)
+	if err != nil {
+		log.Printf("Can't unmarshall rtnetlink message: %v", err)
+	}
+	link := manager.links[hdr.InterfaceIndex()]
+	delete(manager.links, hdr.InterfaceIndex())
+	env := manager.createEmitEnv(link)
+	manager.upstartController.Emit("net-device-removed", env, false)
+}
+
+func (manager *LinkManager) addressRemoved(msg *netlink.Message) {
+	rtmsg, err := addr.ParseMessage(*msg)
+	if err != nil {
+		log.Printf("Can't parse addr message")
+	}
+	hdr, _ := rtmsg.Header.(*addr.Header)
+	ipAddrAttr, err := rtmsg.GetAttribute(addr.IFA_ADDRESS)
+	delIp := convertNlAddrToIp(&ipAddrAttr)
+	link := manager.links[hdr.InterfaceIndex()]
+	log.Printf("Removing address %s from interface %d", delIp.String(), hdr.InterfaceIndex())
+	var i int = -1
+	for i = range link.addresses {
+		ip := link.addresses[i]
+		if delIp.Equal(*ip) {
+			break
 		}
-	default:
-		log.Printf("Received unhandled message. Header: %v | Body: %v", msg.Header, msg.Body)
+	}
+	if i > -1 {
+		link.addresses = append(link.addresses[:i], link.addresses[i+1:]...)
+		log.Printf("Removed one address from interface %d, %d addresses left", hdr.InterfaceIndex(), len(link.addresses))
+
+	} else {
+		log.Printf("ERROR: Requested to remove unknown address %s from interface %d", delIp.String(), hdr.InterfaceIndex())
+	}
+	if len(link.addresses) == 0 {
+		env := manager.createEmitEnv(link)
+		upstartController.Emit("net-device-down", env, false)
 	}
 }
 
@@ -202,19 +252,37 @@ func (manager *LinkManager) addrReceived(msg *netlink.Message) {
 	ipAddrAttr, err := rtmsg.GetAttribute(addr.IFA_ADDRESS)
 	if err != nil {
 		log.Printf("Can't get IP address attribute: %v", err)
+		return
 	}
-	log.Printf("Received new address for index %d: %v", interfaceIndex, ipAddrAttr.Body)
+
+	link := manager.links[interfaceIndex]
+	if link == nil {
+		log.Printf("Received IP address for unknown interface index %d", interfaceIndex)
+		return
+	}
+	ip := convertNlAddrToIp(&ipAddrAttr)
+	log.Printf("Received new address for index %d: %v", interfaceIndex, ip.String())
+	firstAddress := len(link.addresses) == 0
+	link.addresses = append(link.addresses, &ip)
+	if firstAddress {
+		log.Printf("Received first address, interface should now be ready to be used")
+		env := manager.createEmitEnv(link)
+		upstartController.Emit("net-device-up", env, false)
+	}
+}
+
+func (manager *LinkManager) createEmitEnv(link *LinkHandler) (env []string) {
+	env = append(env, fmt.Sprintf("IFACE=%s", link.LinkName()))
+	if len(link.addresses) > 0 {
+		env = append(env, fmt.Sprintf("ADDR=%s", link.addresses[0].String()))
+	}
+	return
 }
 
 func (manager *LinkManager) interfaceChanged(rtmsg *rtnetlink.Message, lnk *LinkHandler, added bool) {
 	name := lnk.LinkName()
-	var env []string = make([]string, 5)
-	env = append(env, fmt.Sprintf("IFACE=%s", name))
+	env := manager.createEmitEnv(lnk)
 	hdr, _ := rtmsg.Header.(*link.Header)
-
-	if added {
-		manager.queryAddress(lnk.LinkIndex())
-	}
 
 	interfaceChanged := hdr.InterfaceChanges() != 0
 
@@ -225,12 +293,25 @@ func (manager *LinkManager) interfaceChanged(rtmsg *rtnetlink.Message, lnk *Link
 	}
 	if interfaceChanged {
 		log.Printf("Interface %s has changes", name)
-		if lnk.LinkIp() != nil && lnk.LinkFlags()&link.IFF_UP == 1 {
+		if lnk.LinkIp() != nil && lnk.IsUp() {
 			log.Printf("Interface %s is up and ready to be used with address %s", name, lnk.LinkIp().String())
 			env = append(env, fmt.Sprintf("ADDR=%s"), lnk.LinkIp().String())
 			upstartController.Emit("net-device-up", env, false)
-		} else {
-			log.Printf("Interface %s is not ready to be used", name)
+		} else if !lnk.IsUp() {
+			upstartController.Emit("net-device-down", env, false)
+		} else if lnk.IsUp() && len(lnk.addresses) > 0 {
+			upstartController.Emit("net-device-up", env, false)
 		}
 	}
+}
+func convertBytesToIp(body []byte) (ip net.IP) {
+	if len(body) == net.IPv4len {
+		return net.IPv4(body[0], body[1], body[2], body[3])
+	}
+	ip = make(net.IP, net.IPv6len)
+	copy(ip, body)
+	return
+}
+func convertNlAddrToIp(attr *netlink.Attribute) (ip net.IP) {
+	return convertBytesToIp(attr.Body)
 }
