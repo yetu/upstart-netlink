@@ -14,6 +14,7 @@ import (
 
 	"github.com/yetu/go-netlink/rtnetlink/addr"
 	"github.com/yetu/go-netlink/rtnetlink/link"
+	"github.com/yetu/go-netlink/rtnetlink/route"
 )
 import "github.com/yetu/go-netlink/rtnetlink"
 import "github.com/yetu/go-netlink"
@@ -123,6 +124,15 @@ func (manager *LinkManager) queryDevices() (err error) {
 	return
 }
 
+func (manager *LinkManager) queryRoutes() (err error) {
+	nlmsg, err := netlink.NewMessage(rtnetlink.RTM_GETROUTE, netlink.NLM_F_DUMP|netlink.NLM_F_REQUEST, &route.Header{})
+	if err != nil {
+		return
+	}
+	err = manager.l.Query(nlmsg)
+	return
+}
+
 func (manager *LinkManager) queryAddress() (err error) {
 	nlmsg, err := netlink.NewMessage(rtnetlink.RTM_GETADDR, netlink.NLM_F_DUMP|netlink.NLM_F_REQUEST, &addr.Header{})
 	if err != nil {
@@ -149,6 +159,11 @@ func (manager *LinkManager) Start() {
 	err = manager.queryAddress()
 	if err != nil {
 		log.Panicf("Something went wrong when querying addresses: %v", err)
+	}
+
+	err = manager.queryRoutes()
+	if err != nil {
+		log.Panicf("Something went wrong when querying current routes: %v", err)
 	}
 
 	for manager.running {
@@ -195,7 +210,7 @@ func (manager *LinkManager) netlinkMessageReceived(msg *netlink.Message) {
 	case rtnetlink.RTM_DELADDR:
 		manager.addressRemoved(msg)
 	case rtnetlink.RTM_NEWROUTE, rtnetlink.RTM_GETROUTE:
-		log.Printf("Received route message")
+		manager.routeAdded(msg)
 	case netlink.NLMSG_UNSPECIFIED:
 		log.Printf("Received unspecified message. Header: %v Body %v", msg.Header, msg.Body)
 	case netlink.NLMSG_DONE:
@@ -304,6 +319,59 @@ func (manager *LinkManager) interfaceChanged(rtmsg *rtnetlink.Message, lnk *Link
 		}
 	}
 }
+
+func (manager *LinkManager) routeAdded(msg *netlink.Message) {
+	rtmsg, err := route.ParseMessage(*msg)
+	if err != nil {
+		log.Printf("Can't parse route message: %v", err)
+	}
+	hdr, _ := rtmsg.Header.(*route.Header)
+	ifIndex, _ := netlink.GetAttributeUint32(rtmsg, route.RTA_OIF)
+	gatewayAttr, _ := rtmsg.GetAttribute(route.RTA_GATEWAY)
+	destAttr, _ := rtmsg.GetAttribute(route.RTA_DST)
+	destIp := convertNlAddrToIp(&destAttr)
+	gatewayIp := convertNlAddrToIp(&gatewayAttr)
+	log.Printf("Table %s: Interface %d, Gateway: %v, Destination %s",
+		hdr.RoutingTable().String(), ifIndex, gatewayIp.String(), destIp.String())
+	if isDefaultRoute(rtmsg) {
+		log.Printf("We found a default route on interface %d", ifIndex)
+		link := manager.links[ifIndex]
+		env := manager.createEmitEnv(link)
+		manager.upstartController.Emit("default-route-added", env, false)
+	}
+}
+
+func (manager *LinkManager) routeDeleted(msg *netlink.Message) {
+	rtmsg, err := route.ParseMessage(*msg)
+	if err != nil {
+		log.Printf("Can't parse rtnetlink route message: %v", err)
+	}
+	if isDefaultRoute(rtmsg) {
+		ifIndex, _ := netlink.GetAttributeUint32(rtmsg, route.RTA_OIF)
+		link := manager.links[ifIndex]
+		env := manager.createEmitEnv(link)
+		manager.upstartController.Emit("default-route-removed", env, false)
+	}
+}
+
+func isDefaultRoute(rtmsg *rtnetlink.Message) bool {
+	hdr, _ := rtmsg.Header.(*route.Header)
+	if hdr.RoutingTable() != route.RT_TABLE_MAIN {
+		return false
+	}
+	_, err := rtmsg.GetAttribute(route.RTA_GATEWAY)
+	if err != nil {
+		return false
+	}
+
+	_, err = rtmsg.GetAttribute(route.RTA_DST)
+	if err == nil {
+		return false
+	}
+
+	return true
+}
+
 func convertBytesToIp(body []byte) (ip net.IP) {
 	if len(body) == net.IPv4len {
 		return net.IPv4(body[0], body[1], body[2], body[3])
@@ -313,5 +381,9 @@ func convertBytesToIp(body []byte) (ip net.IP) {
 	return
 }
 func convertNlAddrToIp(attr *netlink.Attribute) (ip net.IP) {
+	if attr == nil {
+		ip = nil
+		return
+	}
 	return convertBytesToIp(attr.Body)
 }
