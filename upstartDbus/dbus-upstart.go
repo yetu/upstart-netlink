@@ -8,7 +8,7 @@ import (
 
 type Controller struct {
 	conn          *dbus.Conn
-	upstartObject *dbus.Object
+	upstartObject dbus.BusObject
 }
 
 func NewController() (controller *Controller, fail error) {
