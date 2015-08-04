@@ -8,7 +8,7 @@ import (
 
 type Controller struct {
 	conn          *dbus.Conn
-	upstartObject dbus.Object
+	upstartObject *dbus.Object
 }
 
 func NewController() (controller *Controller, fail error) {
@@ -26,7 +26,7 @@ func NewController() (controller *Controller, fail error) {
 	}
 	obj := con.Object("com.ubuntu.Upstart", "/com/ubuntu/Upstart")
 
-	controller = &Controller{conn: con, upstartObject: *obj}
+	controller = &Controller{conn: con, upstartObject: obj}
 	return
 }
 
